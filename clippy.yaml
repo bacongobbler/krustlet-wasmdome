@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: clippy
+spec:
+  containers:
+    - image: webassembly.azurecr.io/clippy:0.1.0
+      name: clippy
+  nodeSelector:
+    kubernetes.io/role: agent
+    beta.kubernetes.io/os: linux
+    beta.kubernetes.io/arch: wasm32-wascc
+  tolerations:
+    - key: "node.kubernetes.io/network-unavailable"
+      operator: "Exists"
+      effect: "NoSchedule"
+    - key: "krustlet/arch"
+      operator: "Equal"
+      value: "wasm32-wascc"
+      effect: "NoExecute"
