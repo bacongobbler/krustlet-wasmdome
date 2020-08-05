@@ -25,7 +25,6 @@ wascc-fs = { version = "0.1", features = ["static_plugin"] }
 wascc-httpsrv = { version = "0.7", features = ["static_plugin"] }
 wascc-logging = { version = "0.7", features = ["static_plugin"] }
 wascc-host = { version = "0.10", features = ["lattice"] }
-engine-provider = { git = "https://github.com/wascc/wasmdome" }
 
 [features]
 default = ["native-tls"]

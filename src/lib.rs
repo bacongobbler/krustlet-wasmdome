@@ -32,7 +32,6 @@
 #![deny(missing_docs)]
 
 use async_trait::async_trait;
-use engine_provider::WasmdomeEngineProvider;
 use k8s_openapi::api::core::v1::{ContainerStatus as KubeContainerStatus, Pod as KubePod};
 use kube::{api::DeleteParams, Api};
 use kubelet::container::Container;
@@ -80,9 +79,6 @@ const HTTP_CAPABILITY: &str = "wascc:http_server";
 
 /// The name of the Logging capability.
 const LOG_CAPABILITY: &str = "wascc:logging";
-
-/// The name of the Wasmdome engine capability.
-const WASMDOME_CAPABILITY: &str = "wasmdome:engine";
 
 /// The root directory of waSCC logs.
 const LOG_DIR_NAME: &str = "wascc-logs";
@@ -186,17 +182,6 @@ impl WasccProvider {
                 .unwrap()
                 .add_native_capability(data)
                 .map_err(|e| anyhow::anyhow!("Failed to add HTTP capability: {}", e))?;
-
-            info!("Loading wasmdome capability");
-            let wasmdome_provider = WasmdomeEngineProvider::new();
-            let data = NativeCapability::from_instance(wasmdome_provider, None)
-                .map_err(|e| anyhow::anyhow!("Failed to instantiate wasmdome capability: {}", e))?;
-
-            cloned_host
-                .lock()
-                .unwrap()
-                .add_native_capability(data)
-                .map_err(|e| anyhow::anyhow!("Failed to add wasmdome capability: {}", e))?;
 
             info!("Loading log capability");
             let logging_provider = LoggingProvider::new();
@@ -660,14 +645,6 @@ fn wascc_run(
     if actor_caps.contains(&LOG_CAPABILITY.to_owned()) {
         capabilities.push(Capability {
             name: LOG_CAPABILITY,
-            binding: None,
-            env: HashMap::new(),
-        });
-    }
-
-    if actor_caps.contains(&WASMDOME_CAPABILITY.to_owned()) {
-        capabilities.push(Capability {
-            name: WASMDOME_CAPABILITY,
             binding: None,
             env: HashMap::new(),
         });
