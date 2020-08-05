@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use kubelet::config::Config;
+use kubelet::store::composite::ComposableStore;
 use kubelet::store::oci::FileStore;
 use kubelet::Kubelet;
 
-use krustlet_wasmdome::Provider;
+use krustlet_wasmdome::WasccProvider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -13,14 +16,27 @@ async fn main() -> anyhow::Result<()> {
     // Initialize the logger
     env_logger::init();
 
-    let kubeconfig = kubelet::bootstrap(&config, &config.bootstrap_file).await?;
+    let kubeconfig = kubelet::bootstrap(&config, &config.bootstrap_file, notify_bootstrap).await?;
+    let store = make_store(&config);
 
-    let client = oci_distribution::Client::default();
-    let mut store_path = config.data_dir.join("oci");
-    store_path.push("modules");
-    let store = FileStore::new(client, &store_path);
-
-    let provider = Provider::new(store, &config, kubeconfig.clone()).await?;
+    let provider = WasccProvider::new(store, &config, kubeconfig.clone()).await?;
     let kubelet = Kubelet::new(provider, kubeconfig, config).await?;
     kubelet.start().await
+}
+
+fn make_store(config: &Config) -> Arc<dyn kubelet::store::Store + Send + Sync> {
+    let client = oci_distribution::Client::default();
+    let mut store_path = config.data_dir.join(".oci");
+    store_path.push("modules");
+    let file_store = Arc::new(FileStore::new(client, &store_path));
+
+    if config.allow_local_modules {
+        file_store.with_override(Arc::new(kubelet::store::fs::FileSystemStore {}))
+    } else {
+        file_store
+    }
+}
+
+fn notify_bootstrap(message: String) {
+    println!("BOOTSTRAP: {}", message);
 }

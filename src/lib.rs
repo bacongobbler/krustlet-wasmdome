@@ -1,39 +1,88 @@
-//! A custom krustlet backend that can run [waSCC](https://wascc.dev/) based workloads.
+//! A custom kubelet backend that can run [waSCC](https://wascc.dev/) based workloads
 //!
-//! The crate provides the [`Provider`] type which can be used as a provider with [`kubelet`].
+//! The crate provides the [`WasccProvider`] type which can be used
+//! as a provider with [`kubelet`].
+//!
+//! # Example
+//! ```rust,no_run
+//! use kubelet::{Kubelet, config::Config};
+//! use kubelet::store::oci::FileStore;
+//! use std::sync::Arc;
+//! use wascc_provider::WasccProvider;
+//!
+//! async fn start() {
+//!     // Get a configuration for the Kubelet
+//!     let kubelet_config = Config::default();
+//!     let client = oci_distribution::Client::default();
+//!     let store = Arc::new(FileStore::new(client, &std::path::PathBuf::from("")));
+//!
+//!     // Load a kubernetes configuration
+//!     let kubeconfig = kube::Config::infer().await.unwrap();
+//!
+//!     // Instantiate the provider type
+//!     let provider = WasccProvider::new(store, &kubelet_config, kubeconfig.clone()).await.unwrap();
+//!
+//!     // Instantiate the Kubelet
+//!     let kubelet = Kubelet::new(provider, kubeconfig, kubelet_config).await.unwrap();
+//!     // Start the Kubelet and block on it
+//!     kubelet.start().await.unwrap();
+//! }
+//! ```
 
 #![deny(missing_docs)]
 
 use async_trait::async_trait;
+use engine_provider::WasmdomeEngineProvider;
 use k8s_openapi::api::core::v1::{ContainerStatus as KubeContainerStatus, Pod as KubePod};
 use kube::{api::DeleteParams, Api};
-use kubelet::container::{Handle as ContainerHandle, Status as ContainerStatus};
+use kubelet::container::Container;
+use kubelet::container::{
+    ContainerKey, Handle as ContainerHandle, HandleMap as ContainerHandleMap,
+    Status as ContainerStatus,
+};
 use kubelet::handle::StopHandler;
 use kubelet::node::Builder;
 use kubelet::pod::{key_from_pod, pod_key, Handle};
-use kubelet::pod::{update_status, Phase, Pod, Status as PodStatus};
-use kubelet::provider::Provider as KubeProvider;
+use kubelet::pod::{
+    update_status, Phase, Pod, Status as PodStatus, StatusMessage as PodStatusMessage,
+};
+use kubelet::provider::Provider;
 use kubelet::provider::ProviderError;
 use kubelet::store::Store;
 use kubelet::volume::Ref;
 use log::{debug, error, info, trace};
+use std::error::Error;
+use std::fmt;
 use tempfile::NamedTempFile;
 use tokio::sync::watch::{self, Receiver};
 use tokio::sync::RwLock;
 use wascc_fs::FileSystemProvider;
 use wascc_host::{Actor, NativeCapability, WasccHost};
-use engine_provider::WasmdomeEngineProvider;
+use wascc_httpsrv::HttpServerProvider;
+use wascc_logging::LoggingProvider;
 
-use std::collections::HashMap;
+extern crate rand;
+use rand::Rng;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 
 /// The architecture that the pod targets.
 const TARGET_WASM32_WASCC: &str = "wasm32-wascc";
 
 /// The name of the Filesystem capability.
 const FS_CAPABILITY: &str = "wascc:blobstore";
+
+/// The name of the HTTP capability.
+const HTTP_CAPABILITY: &str = "wascc:http_server";
+
+/// The name of the Logging capability.
+const LOG_CAPABILITY: &str = "wascc:logging";
+
+/// The name of the Wasmdome engine capability.
+const WASMDOME_CAPABILITY: &str = "wasmdome:engine";
 
 /// The root directory of waSCC logs.
 const LOG_DIR_NAME: &str = "wascc-logs";
@@ -81,32 +130,34 @@ impl StopHandler for ActorHandle {
     }
 }
 
-/// Provider provides a Kubelet runtime implementation that executes WASM binaries.
+/// WasccProvider provides a Kubelet runtime implementation that executes WASM binaries.
 ///
 /// Currently, this runtime uses WASCC as a host, loading the primary container as an actor.
 /// TODO: In the future, we will look at loading capabilities using the "sidecar" metaphor
 /// from Kubernetes.
 #[derive(Clone)]
-pub struct Provider<S> {
+pub struct WasccProvider {
     handles: Arc<RwLock<HashMap<String, Handle<ActorHandle, LogHandleFactory>>>>,
-    store: S,
+    store: Arc<dyn Store + Sync + Send>,
     volume_path: PathBuf,
     log_path: PathBuf,
     kubeconfig: kube::Config,
     host: Arc<Mutex<WasccHost>>,
+    port_map: Arc<TokioMutex<HashMap<i32, String>>>,
 }
 
-impl<S: Store + Send + Sync> Provider<S> {
+impl WasccProvider {
     /// Returns a new wasCC provider configured to use the proper data directory
     /// (including creating it if necessary)
     pub async fn new(
-        store: S,
+        store: Arc<dyn Store + Sync + Send>,
         config: &kubelet::config::Config,
         kubeconfig: kube::Config,
     ) -> anyhow::Result<Self> {
         let host = Arc::new(Mutex::new(WasccHost::new()));
         let log_path = config.data_dir.join(LOG_DIR_NAME);
         let volume_path = config.data_dir.join(VOLUME_DIR);
+        let port_map = Arc::new(TokioMutex::new(HashMap::<i32, String>::new()));
         tokio::fs::create_dir_all(&log_path).await?;
         tokio::fs::create_dir_all(&volume_path).await?;
 
@@ -125,15 +176,37 @@ impl<S: Store + Send + Sync> Provider<S> {
         // be compiled into the wascc-provider binary.
         let cloned_host = host.clone();
         tokio::task::spawn_blocking(move || {
-            info!("Loading Wasmdome capability");
-            let wasmdome_provider = WasmdomeEngineProvider::new();
-            let data = NativeCapability::from_instance(wasmdome_provider, None)
-                .map_err(|e| anyhow::anyhow!("Failed to instantiate wasmdome capability: {}", e))?;
+            info!("Loading HTTP capability");
+            let http_provider = HttpServerProvider::new();
+            let data = NativeCapability::from_instance(http_provider, None)
+                .map_err(|e| anyhow::anyhow!("Failed to instantiate HTTP capability: {}", e))?;
+
             cloned_host
                 .lock()
                 .unwrap()
                 .add_native_capability(data)
-                .map_err(|e| anyhow::anyhow!("Failed to add wasmdome capability: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to add HTTP capability: {}", e))?;
+
+            info!("Loading wasmdome capability");
+            let wasmdome_provider = WasmdomeEngineProvider::new();
+            let data = NativeCapability::from_instance(wasmdome_provider, None)
+                .map_err(|e| anyhow::anyhow!("Failed to instantiate wasmdome capability: {}", e))?;
+
+            cloned_host
+                .lock()
+                .unwrap()
+                .add_native_capability(data)
+                .map_err(|e| anyhow::anyhow!("Failed to add wasmdome capability: {}", e))?;
+
+            info!("Loading log capability");
+            let logging_provider = LoggingProvider::new();
+            let logging_capability = NativeCapability::from_instance(logging_provider, None)
+                .map_err(|e| anyhow::anyhow!("Failed to instantiate log capability: {}", e))?;
+            cloned_host
+                .lock()
+                .unwrap()
+                .add_native_capability(logging_capability)
+                .map_err(|e| anyhow::anyhow!("Failed to add log capability: {}", e))
         })
         .await??;
         Ok(Self {
@@ -143,12 +216,137 @@ impl<S: Store + Send + Sync> Provider<S> {
             log_path,
             kubeconfig,
             host,
+            port_map,
         })
+    }
+
+    async fn assign_container_port(&self, pod: &Pod, container: &Container) -> anyhow::Result<i32> {
+        let mut port_assigned: i32 = 0;
+        if let Some(container_vec) = container.ports().as_ref() {
+            for c_port in container_vec.iter() {
+                let container_port = c_port.container_port;
+                if let Some(host_port) = c_port.host_port {
+                    let mut lock = self.port_map.lock().await;
+                    if !lock.contains_key(&host_port) {
+                        port_assigned = host_port;
+                        lock.insert(port_assigned, pod.name().to_string());
+                    } else {
+                        error!(
+                            "Failed to assign hostport {}, because it's taken",
+                            &host_port
+                        );
+                        return Err(anyhow::anyhow!("Port {} is currently in use", &host_port));
+                    }
+                } else if container_port >= 0 && container_port <= 65536 {
+                    port_assigned =
+                        find_available_port(&self.port_map, pod.name().to_string()).await?;
+                }
+            }
+        }
+        Ok(port_assigned)
+    }
+
+    async fn start_container(
+        &self,
+        run_context: &mut ModuleRunContext<'_>,
+        container: &Container,
+        pod: &Pod,
+        port_assigned: i32,
+    ) -> anyhow::Result<()> {
+        let env = Self::env_vars(&container, &pod, run_context.client).await;
+        let volume_bindings: Vec<VolumeBinding> =
+            if let Some(volume_mounts) = container.volume_mounts().as_ref() {
+                volume_mounts
+                    .iter()
+                    .map(|vm| -> anyhow::Result<VolumeBinding> {
+                        // Check the volume exists first
+                        let vol = run_context.volumes.get(&vm.name).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no volume with the name of {} found for container {}",
+                                vm.name,
+                                container.name()
+                            )
+                        })?;
+                        // We can safely assume that this should be valid UTF-8 because it would have
+                        // been validated by the k8s API
+                        Ok(VolumeBinding {
+                            name: vm.name.clone(),
+                            host_path: vol.deref().clone(),
+                        })
+                    })
+                    .collect::<anyhow::Result<_>>()?
+            } else {
+                vec![]
+            };
+
+        debug!("Starting container {} on thread", container.name());
+
+        let module_data = run_context
+            .modules
+            .remove(container.name())
+            .expect("FATAL ERROR: module map not properly populated");
+        let lp = self.log_path.clone();
+        let (status_sender, status_recv) = watch::channel(ContainerStatus::Waiting {
+            timestamp: chrono::Utc::now(),
+            message: "No status has been received from the process".into(),
+        });
+        let host = self.host.clone();
+        let wascc_result = tokio::task::spawn_blocking(move || {
+            wascc_run(
+                host,
+                module_data,
+                env,
+                volume_bindings,
+                &lp,
+                status_recv,
+                port_assigned,
+            )
+        })
+        .await?;
+        match wascc_result {
+            Ok(handle) => {
+                run_context
+                    .container_handles
+                    .insert(ContainerKey::App(container.name().to_string()), handle);
+                status_sender
+                    .broadcast(ContainerStatus::Running {
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .expect("status should be able to send");
+                Ok(())
+            }
+            Err(e) => {
+                // We can't broadcast here because the receiver has been dropped at this point
+                // (it was never used in creating a runtime handle)
+                let mut container_statuses = HashMap::new();
+                container_statuses.insert(
+                    ContainerKey::App(container.name().to_string()),
+                    ContainerStatus::Terminated {
+                        timestamp: chrono::Utc::now(),
+                        failed: true,
+                        message: format!("Error while starting container: {:?}", e),
+                    },
+                );
+                let status = PodStatus {
+                    message: PodStatusMessage::LeaveUnchanged,
+                    container_statuses,
+                };
+                pod.patch_status(run_context.client.clone(), status).await;
+                Err(anyhow::anyhow!("Failed to run pod: {}", e))
+            }
+        }
     }
 }
 
+struct ModuleRunContext<'a> {
+    client: &'a kube::Client,
+    modules: &'a mut HashMap<String, Vec<u8>>,
+    volumes: &'a HashMap<String, Ref>,
+    container_handles: &'a mut ContainerHandleMap<ActorHandle, LogHandleFactory>,
+}
+
 #[async_trait]
-impl<S: Store + Send + Sync> KubeProvider for Provider<S> {
+impl Provider for WasccProvider {
     const ARCH: &'static str = TARGET_WASM32_WASCC;
 
     async fn node(&self, builder: &mut Builder) -> anyhow::Result<()> {
@@ -164,93 +362,44 @@ impl<S: Store + Send + Sync> KubeProvider for Provider<S> {
         // produces an error, in which case we mark it Failed.
         debug!("Pod added {:?}", pod.name());
 
+        validate_pod_runnable(&pod)?;
+
         info!("Starting containers for pod {:?}", pod.name());
         let mut modules = self.store.fetch_pod_modules(&pod).await?;
         let mut container_handles = HashMap::new();
         let client = kube::Client::new(self.kubeconfig.clone());
         let volumes = Ref::volumes_from_pod(&self.volume_path, &pod, &client).await?;
+
+        let mut run_context = ModuleRunContext {
+            client: &client,
+            modules: &mut modules,
+            volumes: &volumes,
+            container_handles: &mut container_handles,
+        };
+
         for container in pod.containers() {
-            let volume_bindings: Vec<VolumeBinding> =
-                if let Some(volume_mounts) = container.volume_mounts.as_ref() {
-                    volume_mounts
-                        .iter()
-                        .map(|vm| -> anyhow::Result<VolumeBinding> {
-                            // Check the volume exists first
-                            let vol = volumes.get(&vm.name).ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "no volume with the name of {} found for container {}",
-                                    vm.name,
-                                    container.name
-                                )
-                            })?;
-                            // We can safely assume that this should be valid UTF-8 because it would have
-                            // been validated by the k8s API
-                            Ok(VolumeBinding {
-                                name: vm.name.clone(),
-                                host_path: vol.deref().clone(),
-                            })
-                        })
-                        .collect::<anyhow::Result<_>>()?
-                } else {
-                    vec![]
-                };
+            let port_assigned = self.assign_container_port(&pod, &container).await?;
+            debug!(
+                "New port assigned to {} is: {}",
+                container.name(),
+                port_assigned
+            );
 
-            debug!("Starting container {} on thread", container.name);
-
-            let module_data = modules
-                .remove(&container.name)
-                .expect("FATAL ERROR: module map not properly populated");
-            let lp = self.log_path.clone();
-            let (status_sender, status_recv) = watch::channel(ContainerStatus::Waiting {
-                timestamp: chrono::Utc::now(),
-                message: "No status has been received from the process".into(),
-            });
-            let host = self.host.clone();
-            let wascc_result = tokio::task::spawn_blocking(move || {
-                wascc_run(host, module_data, &mut Vec::new(), volume_bindings, &lp, status_recv)
-            })
-            .await?;
-            match wascc_result {
-                Ok(handle) => {
-                    container_handles.insert(container.name.clone(), handle);
-                    status_sender
-                        .broadcast(ContainerStatus::Running {
-                            timestamp: chrono::Utc::now(),
-                        })
-                        .expect("status should be able to send");
-                }
-                Err(e) => {
-                    // We can't broadcast here because the receiver has been dropped at this point
-                    // (it was never used in creating a runtime handle)
-                    let mut container_statuses = HashMap::new();
-                    container_statuses.insert(
-                        container.name.clone(),
-                        ContainerStatus::Terminated {
-                            timestamp: chrono::Utc::now(),
-                            failed: true,
-                            message: format!("Error while starting container: {:?}", e),
-                        },
-                    );
-                    let status = PodStatus {
-                        message: None,
-                        container_statuses,
-                    };
-                    pod.patch_status(client.clone(), status).await;
-                    return Err(anyhow::anyhow!("Failed to run pod: {}", e));
-                }
-            }
+            self.start_container(&mut run_context, &container, &pod, port_assigned)
+                .await?
         }
         info!(
             "All containers started for pod {:?}. Updating status",
             pod.name()
         );
+
+        let pod_handle_key = key_from_pod(&pod);
+        let pod_handle = Handle::new(container_handles, pod, client, None, None).await?;
+
         // Wrap this in a block so the write lock goes out of scope when we are done
         {
             let mut handles = self.handles.write().await;
-            handles.insert(
-                key_from_pod(&pod),
-                Handle::new(container_handles, pod, client, None)?,
-            );
+            handles.insert(pod_handle_key, pod_handle);
         }
 
         Ok(())
@@ -348,6 +497,14 @@ impl<S: Store + Send + Sync> KubeProvider for Provider<S> {
     }
 
     async fn delete(&self, pod: Pod) -> anyhow::Result<()> {
+        let mut delete_key: i32 = 0;
+        let mut lock = self.port_map.lock().await;
+        for (key, val) in lock.iter() {
+            if val == pod.name() {
+                delete_key = *key
+            }
+        }
+        lock.remove(&delete_key);
         let mut handles = self.handles.write().await;
         match handles.remove(&key_from_pod(&pod)) {
             Some(_) => debug!(
@@ -381,9 +538,78 @@ impl<S: Store + Send + Sync> KubeProvider for Provider<S> {
     }
 }
 
+fn validate_pod_runnable(pod: &Pod) -> anyhow::Result<()> {
+    if !pod.init_containers().is_empty() {
+        return Err(anyhow::anyhow!(
+            "Cannot run {}: spec specifies init containers which are not supported on wasCC",
+            pod.name()
+        ));
+    }
+    for container in pod.containers() {
+        validate_container_runnable(&container)?;
+    }
+    Ok(())
+}
+
+fn validate_container_runnable(container: &Container) -> anyhow::Result<()> {
+    if has_args(container) {
+        return Err(anyhow::anyhow!(
+            "Cannot run {}: spec specifies container args which are not supported on wasCC",
+            container.name()
+        ));
+    }
+
+    Ok(())
+}
+
+fn has_args(container: &Container) -> bool {
+    match &container.args() {
+        None => false,
+        Some(vec) => !vec.is_empty(),
+    }
+}
+
 struct VolumeBinding {
     name: String,
     host_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct PortAllocationError {}
+
+impl PortAllocationError {
+    fn new() -> PortAllocationError {
+        PortAllocationError {}
+    }
+}
+impl fmt::Display for PortAllocationError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "all ports are currently in use")
+    }
+}
+impl Error for PortAllocationError {
+    fn description(&self) -> &str {
+        "all ports are currently in use"
+    }
+}
+
+async fn find_available_port(
+    port_map: &Arc<TokioMutex<HashMap<i32, String>>>,
+    pod_name: String,
+) -> Result<i32, PortAllocationError> {
+    let mut port: Option<i32> = None;
+    let mut empty_port: HashSet<i32> = HashSet::new();
+    let mut lock = port_map.lock().await;
+    while empty_port.len() < 2768 {
+        let generated_port: i32 = rand::thread_rng().gen_range(30000, 32768);
+        port.replace(generated_port);
+        empty_port.insert(port.unwrap());
+        if !lock.contains_key(&port.unwrap()) {
+            lock.insert(port.unwrap(), pod_name);
+            break;
+        }
+    }
+    port.ok_or_else(PortAllocationError::new)
 }
 
 /// Capability describes a waSCC capability.
@@ -416,23 +642,47 @@ impl kubelet::log::HandleFactory<tokio::fs::File> for LogHandleFactory {
 fn wascc_run(
     host: Arc<Mutex<WasccHost>>,
     data: Vec<u8>,
-    capabilities: &mut Vec<Capability>,
+    mut env: EnvVars,
     volumes: Vec<VolumeBinding>,
     log_path: &Path,
     status_recv: Receiver<ContainerStatus>,
+    port_assigned: i32,
 ) -> anyhow::Result<ContainerHandle<ActorHandle, LogHandleFactory>> {
+    let mut capabilities: Vec<Capability> = Vec::new();
     info!("sending actor to wascc host");
     let log_output = NamedTempFile::new_in(log_path)?;
-    let mut logenv: HashMap<String, String> = HashMap::new();
-    logenv.insert(
-        "LOG_PATH".to_string(),
-        log_output.path().to_str().unwrap().to_owned(),
-    );
 
     let load = Actor::from_bytes(data).map_err(|e| anyhow::anyhow!("Error loading WASM: {}", e))?;
     let pk = load.public_key();
 
-    if load.capabilities().contains(&FS_CAPABILITY.to_owned()) {
+    let actor_caps = load.capabilities();
+
+    if actor_caps.contains(&LOG_CAPABILITY.to_owned()) {
+        capabilities.push(Capability {
+            name: LOG_CAPABILITY,
+            binding: None,
+            env: HashMap::new(),
+        });
+    }
+
+    if actor_caps.contains(&WASMDOME_CAPABILITY.to_owned()) {
+        capabilities.push(Capability {
+            name: WASMDOME_CAPABILITY,
+            binding: None,
+            env: HashMap::new(),
+        });
+    }
+
+    if actor_caps.contains(&HTTP_CAPABILITY.to_owned()) {
+        env.insert("PORT".to_string(), port_assigned.to_string());
+        capabilities.push(Capability {
+            name: HTTP_CAPABILITY,
+            binding: None,
+            env,
+        });
+    }
+
+    if actor_caps.contains(&FS_CAPABILITY.to_owned()) {
         for vol in &volumes {
             info!(
                 "Loading File System capability for volume name: '{}' host_path: '{}'",
@@ -485,4 +735,97 @@ fn wascc_run(
         log_handle_factory,
         status_recv,
     ))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use k8s_openapi::api::core::v1::Container as KubeContainer;
+    use serde_json::json;
+
+    fn make_pod_spec(containers: Vec<KubeContainer>) -> Pod {
+        let kube_pod: KubePod = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": "test-pod-spec"
+            },
+            "spec": {
+                "containers": containers
+            }
+        }))
+        .unwrap();
+        Pod::new(kube_pod)
+    }
+
+    #[test]
+    fn can_run_pod_where_container_has_no_args() {
+        let containers: Vec<KubeContainer> = serde_json::from_value(json!([
+            {
+                "name": "greet-wascc",
+                "image": "webassembly.azurecr.io/greet-wascc:v0.4",
+            },
+        ]))
+        .unwrap();
+        let pod = make_pod_spec(containers);
+        validate_pod_runnable(&pod).unwrap();
+    }
+
+    #[test]
+    fn can_run_pod_where_container_has_empty_args() {
+        let containers: Vec<KubeContainer> = serde_json::from_value(json!([
+            {
+                "name": "greet-wascc",
+                "image": "webassembly.azurecr.io/greet-wascc:v0.4",
+                "args": [],
+            },
+        ]))
+        .unwrap();
+        let pod = make_pod_spec(containers);
+        validate_pod_runnable(&pod).unwrap();
+    }
+
+    #[test]
+    fn cannot_run_pod_where_container_has_args() {
+        let containers: Vec<KubeContainer> = serde_json::from_value(json!([
+            {
+                "name": "greet-wascc",
+                "image": "webassembly.azurecr.io/greet-wascc:v0.4",
+                "args": [
+                    "--foo",
+                    "--bar"
+                ]
+            },
+        ]))
+        .unwrap();
+        let pod = make_pod_spec(containers);
+        assert!(validate_pod_runnable(&pod).is_err());
+    }
+
+    #[test]
+    fn cannot_run_pod_where_any_container_has_args() {
+        let containers: Vec<KubeContainer> = serde_json::from_value(json!([
+            {
+                "name": "greet-1",
+                "image": "webassembly.azurecr.io/greet-wascc:v0.4"
+            },
+            {
+                "name": "greet-2",
+                "image": "webassembly.azurecr.io/greet-wascc:v0.4",
+                "args": [
+                    "--foo",
+                    "--bar"
+                ]
+            },
+        ]))
+        .unwrap();
+        let pod = make_pod_spec(containers);
+        let validation = validate_pod_runnable(&pod);
+        assert!(validation.is_err());
+        let message = format!("{}", validation.unwrap_err());
+        assert!(
+            message.contains("greet-2"),
+            "validation error did not give name of bad container"
+        );
+    }
 }
