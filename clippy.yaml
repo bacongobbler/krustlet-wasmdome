@@ -4,7 +4,7 @@ metadata:
   name: clippy
 spec:
   containers:
-    - image: webassembly.azurecr.io/clippy:0.1.0
+    - image: webassembly.azurecr.io/clippy:0.2.0
       name: clippy
   nodeSelector:
     kubernetes.io/role: agent
