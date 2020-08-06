@@ -74,6 +74,9 @@ const TARGET_WASM32_WASCC: &str = "wasm32-wascc";
 /// The name of the Filesystem capability.
 const FS_CAPABILITY: &str = "wascc:blobstore";
 
+// The name of the wasmdome engine capability.
+const WASMDOME_CAPABILITY: &str = "wasmdome:engine";
+
 /// The name of the HTTP capability.
 const HTTP_CAPABILITY: &str = "wascc:http_server";
 
@@ -645,6 +648,14 @@ fn wascc_run(
     if actor_caps.contains(&LOG_CAPABILITY.to_owned()) {
         capabilities.push(Capability {
             name: LOG_CAPABILITY,
+            binding: None,
+            env: HashMap::new(),
+        });
+    }
+
+    if actor_caps.contains(&WASMDOME_CAPABILITY.to_owned()) {
+        capabilities.push(Capability {
+            name: WASMDOME_CAPABILITY,
             binding: None,
             env: HashMap::new(),
         });
